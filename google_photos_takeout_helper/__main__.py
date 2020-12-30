@@ -107,7 +107,7 @@ def main():
 
     # Statistics:
     s_removed_duplicates_count = 0
-    s_copied_files = 0
+    s_copied_files = []
     s_cant_insert_exif_files = []  # List of files where inserting exif failed
     s_date_from_folder_files = []  # List of files where date was set from folder name
     s_skipped_extra_files = []  # List of extra files ("-edited" etc) which were skipped
@@ -577,7 +577,7 @@ def main():
                                           watch_for_duplicates=not args.keep_duplicates)
             nonlocal s_copied_files
             if copyfile(file, new_file):
-                s_copied_files += 1
+                s_copied_files.append(str(file))
                 return True
         return False
 
@@ -593,7 +593,7 @@ def main():
 
         nonlocal s_copied_files
         if copyfile(file, new_file):
-            s_copied_files += 1
+            s_copied_files.append(str(file))
             return True
         return False
 
@@ -639,7 +639,11 @@ def main():
     print('DONE! FREEDOM!')
     print()
     print("Final statistics:")
-    print(f"Files copied to target folder: {s_copied_files}")
+    print(f"Files copied to target folder: {len(s_copied_files)}")
+    with open(PHOTOS_DIR / 'copied_files.txt', 'w') as f:
+        f.write("# This file contains all the backed up files with their original full pathname.\n")
+        f.write("\n".join(s_copied_files))
+        print(f"You have full list in {f.name}")
     print(f"Removed duplicates: {s_removed_duplicates_count}")
     print(f"Files where inserting correct exif failed: {len(s_cant_insert_exif_files)}")
     with open(PHOTOS_DIR / 'failed_inserting_exif.txt', 'w') as f:
