@@ -72,6 +72,12 @@ def main():
         help="Create folders and subfolders based on the date the photos were taken"
              "If you use the --dont-copy flag, or the --dont-fix flag, this is useless"
     )
+    parser.add_argument(
+        "--divide-to-days",
+        action='store_true',
+        help="Create folders based on the date the photos were taken. E.g. you will get something like /2019-07-12/IMG_1234.jpg. "
+             "If you use the --dont-copy flag, or the --dont-fix flag, this is useless"
+    )
     args = parser.parse_args()
 
     print('DISCLAIMER!')
@@ -104,8 +110,14 @@ def main():
         '-edytowane',  # PL
         # Add more "edited" flags in more languages if you want. They need to be lowercase.
     ]
+    descriptive_formats = ['.json', '.html', '.htm', '.txt']
 
     # Statistics:
+    s_file_before_deduplication = []
+    s_file_after_deduplication = []
+    s_photo_video_files = []
+    s_descriptive_files = []
+    s_other_files = []
     s_removed_duplicates_count = 0
     s_copied_files = []
     s_cant_insert_exif_files = []  # List of files where inserting exif failed
@@ -119,9 +131,14 @@ def main():
       dir: Path,
       file_function=lambda fi: True,
       folder_function=lambda fo: True,
-      filter_fun=lambda file: True
+      filter_fun=lambda file: True,
+      progress_fun=lambda pct: None
     ):
+        file_count = len([file for file in dir.rglob("*")])
+        processed_count = 0
         for file in dir.rglob("*"):
+            progress_fun( float(processed_count / file_count))
+            processed_count += 1
             if file.is_dir():
                 folder_function(file)
                 continue
@@ -157,6 +174,16 @@ def main():
         if file.suffix.lower() not in video_formats:
             return False
         return True
+
+    def is_descriptive(file: Path):
+        if file.suffix.lower() in descriptive_formats:
+            return True
+        return False
+
+    def is_other(file: Path):
+        if not is_photo(file) and not is_video(file) and not is_descriptive(file):
+            return True
+        return False
 
     def chunk_reader(fobj, chunk_size=1024):
         """ Generator that reads a file in chunks of bytes """
@@ -261,6 +288,26 @@ def main():
         nonlocal s_removed_duplicates_count
         s_removed_duplicates_count += len(duplicates)
         return True
+
+    # PART 1-2: statistics
+    def stat_everything_before_deduplication(file: Path):
+        if file.is_file():
+            s_file_before_deduplication.append(str(file.resolve()))
+
+    def stat_everything_after_deduplication(file: Path):
+        if file.is_file():
+            s_file_after_deduplication.append(str(file.resolve()))
+
+        if is_photo(file) or is_video(file):
+            s_photo_video_files.append(str(file.resolve()))
+        elif is_descriptive(file):
+            s_descriptive_files.append(str(file.resolve()))
+        elif is_other(file):
+            s_other_files.append(str(file.resolve()))
+        else:
+            print(f"Cannot detect type for file: {file}.")
+            print("Terminating program...")
+            exit(-1) 
 
     # PART 2: Fixing metadata and date-related stuff
 
@@ -541,16 +588,13 @@ def main():
     # PART 3: Copy all photos and videos to target folder
 
     # Makes a new name like 'photo(1).jpg'
-    def new_name_if_exists(file: Path, watch_for_duplicates=True):
+    def new_name_if_exists(file: Path):
         new_name = file
         i = 1
         while True:
             if not new_name.is_file():
                 return new_name
             else:
-                if watch_for_duplicates:
-                    if new_name.stat().st_size == file.stat().st_size:
-                        return file
                 new_name = file.with_name(f"{file.stem}({i}){file.suffix}")
                 i += 1
 
@@ -573,23 +617,22 @@ def main():
 
     def copy_to_target(file: Path):
         if is_photo(file) or is_video(file):
-            new_file = new_name_if_exists(FIXED_DIR / file.name,
-                                          watch_for_duplicates=not args.keep_duplicates)
+            new_file = new_name_if_exists(FIXED_DIR / file.name)
             nonlocal s_copied_files
             if copyfile(file, new_file):
                 s_copied_files.append(str(file))
                 return True
         return False
 
-    def copy_to_target_and_divide(file: Path):
+    def copy_to_target_and_divide_YYYY_MM(file: Path):
         creation_date = file.stat().st_mtime
         date = _datetime.fromtimestamp(creation_date)
 
+         # Make folder like 2019/07
         new_path = FIXED_DIR / f"{date.year}/{date.month:02}/"
         new_path.mkdir(parents=True, exist_ok=True)
 
-        new_file = new_name_if_exists(new_path / file.name,
-                                      watch_for_duplicates=not args.keep_duplicates)
+        new_file = new_name_if_exists(new_path / file.name)
 
         nonlocal s_copied_files
         if copyfile(file, new_file):
@@ -597,14 +640,55 @@ def main():
             return True
         return False
 
+    def copy_to_target_and_divide_YYYYMMDD(file: Path):
+        creation_date = file.stat().st_mtime
+        date = _datetime.fromtimestamp(creation_date)
+
+        # Make folder like 2019-07-12
+        new_path = FIXED_DIR / f"{date.year:04}-{date.month:02}-{date.day:02}/"
+        new_path.mkdir(parents=True, exist_ok=True)
+
+        new_file = new_name_if_exists(new_path / file.name)
+
+        nonlocal s_copied_files
+        if copyfile(file, new_file):
+            s_copied_files.append(str(file))
+            return True
+        return False
+
+    def report_progress(progress):
+        symbols = ('-', '/', '|', '\\')
+        i = int(progress*10000) % 4
+        print("={}= Progress: {:.2%} ={}=".format(symbols[i], progress, symbols[i]), end='\r')
+
+    print('=====================')
+    print('Scanning directories pass 1...')
+    print('=====================')
+    for_all_files_recursive(
+            dir=PHOTOS_DIR,
+            file_function=stat_everything_before_deduplication,
+            progress_fun=report_progress
+        )
+
     if not args.keep_duplicates:
         print('=====================')
         print('Removing duplicates...')
         print('=====================')
         for_all_files_recursive(
             dir=PHOTOS_DIR,
-            folder_function=remove_duplicates
+            folder_function=remove_duplicates,
+            progress_fun=report_progress
         )
+
+    print('=====================')
+    print('Scanning directories pass 2...')
+    print('=====================')
+    for_all_files_recursive(
+            dir=PHOTOS_DIR,
+            file_function=stat_everything_after_deduplication,
+            progress_fun=report_progress
+        )
+
     if not args.dont_fix:
         print('=====================')
         print('Fixing files metadata and creation dates...')
@@ -612,39 +696,82 @@ def main():
         for_all_files_recursive(
             dir=PHOTOS_DIR,
             file_function=fix_metadata,
-            filter_fun=lambda f: (is_photo(f) or is_video(f))
+            filter_fun=lambda f: (is_photo(f) or is_video(f)),
+            progress_fun=report_progress
         )
-    if not args.dont_fix and not args.dont_copy and args.divide_to_dates:
-        print('=====================')
-        print('Creating subfolders and dividing files based on date...')
-        print('=====================')
-        for_all_files_recursive(
-            dir=PHOTOS_DIR,
-            file_function=copy_to_target_and_divide,
-            filter_fun=lambda f: (is_photo(f) or is_video(f))
-        )
+    if not args.dont_fix and not args.dont_copy and (args.divide_to_dates or args.divide_to_days):
+        if args.divide_to_dates:
+            print('=====================')
+            print('Creating subfolders and dividing files based on date...')
+            print('=====================')
+            for_all_files_recursive(
+                dir=PHOTOS_DIR,
+                file_function=copy_to_target_and_divide_YYYY_MM,
+                filter_fun=lambda f: (is_photo(f) or is_video(f)),
+                progress_fun=report_progress
+            )
+        elif args.divide_to_days:
+            print('=====================')
+            print('Creating subfolders and dividing files based on date...')
+            print('=====================')
+            for_all_files_recursive(
+                dir=PHOTOS_DIR,
+                file_function=copy_to_target_and_divide_YYYYMMDD,
+                filter_fun=lambda f: (is_photo(f) or is_video(f)),
+                progress_fun=report_progress
+            )
     elif not args.dont_copy:
         print('=====================')
         print('Coping all files to one folder...')
         print('(If you want, you can get them organized in folders based on year and month.'
-              ' Run with --divide-to-dates to do this)')
+              ' Run with --divide-to-dates or --divide-to-days to do this)')
         print('=====================')
         for_all_files_recursive(
             dir=PHOTOS_DIR,
             file_function=copy_to_target,
-            filter_fun=lambda f: (is_photo(f) or is_video(f))
+            filter_fun=lambda f: (is_photo(f) or is_video(f)),
+            progress_fun=report_progress
         )
 
     print()
     print('DONE! FREEDOM!')
     print()
     print("Final statistics:")
+    print(f"Files before deduplication: {len(s_file_before_deduplication)}")
+
     print(f"Files copied to target folder: {len(s_copied_files)}")
     with open(PHOTOS_DIR / 'copied_files.txt', 'w') as f:
         f.write("# This file contains all the backed up files with their original full pathname.\n")
         f.write("\n".join(s_copied_files))
         print(f"You have full list in {f.name}")
     print(f"Removed duplicates: {s_removed_duplicates_count}")
+
+    print(f"Files after deduplication: {len(s_file_after_deduplication)}")
+
+    print(f"Actual removed duplicated files: {len(s_file_before_deduplication) - len(s_file_after_deduplication)} ")
+    print(f"Recorded removed duplicated files: {s_removed_duplicates_count}")
+
+    if len(s_file_before_deduplication) - len(s_file_after_deduplication) != s_removed_duplicates_count:
+        print("WARNING: recorded duplicated files not matching with actual removed ones.")
+
+    print(f"Files are either photo or video: {len(s_photo_video_files)}")
+    with open(PHOTOS_DIR / 'stats_photovideo.txt', 'w') as f:
+        f.write("# This file contains all recognized photo and video files.\n")
+        f.write("\n".join(s_photo_video_files))
+        print(f"You have full list in {f.name}")
+
+    print(f"Files are for description: {len(s_descriptive_files)}")
+    with open(PHOTOS_DIR / 'stats_descriptive.txt', 'w') as f:
+        f.write("# This file contains all recognized description files.\n")
+        f.write("\n".join(s_descriptive_files))
+        print(f"You have full list in {f.name}")
+
+    print(f"Files cannot decide usage: {len(s_other_files)}")
+    with open(PHOTOS_DIR / 'stats_other.txt', 'w') as f:
+        f.write("# This file contains all unrecognized files.\n")
+        f.write("\n".join(s_other_files))
+        print(f"You have full list in {f.name}")
+
     print(f"Files where inserting correct exif failed: {len(s_cant_insert_exif_files)}")
     with open(PHOTOS_DIR / 'failed_inserting_exif.txt', 'w') as f:
         f.write("# This file contains list of files where setting right exif date failed\n")
