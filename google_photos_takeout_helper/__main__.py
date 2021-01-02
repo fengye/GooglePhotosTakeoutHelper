@@ -78,6 +78,11 @@ def main():
         help="Create folders based on the date the photos were taken. E.g. you will get something like /2019-07-12/IMG_1234.jpg. "
              "If you use the --dont-copy flag, or the --dont-fix flag, this is useless"
     )
+    parser.add_argument(
+        "--copy-json",
+        action='store_true',
+        help="Copy accompanying json file to the target folder(s)."
+        )
     args = parser.parse_args()
 
     print('DISCLAIMER!')
@@ -104,7 +109,7 @@ def main():
     TAG_PREVIEW_DATE_TIME = 50971
 
     photo_formats = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff', '.svg', '.heic']
-    video_formats = ['.mp4', '.gif', '.mov', '.webm', '.avi', '.wmv', '.rm', '.mpg', '.mpe', '.mpeg', '.m4v']
+    video_formats = ['.mp4', '.gif', '.mov', '.webm', '.avi', '.wmv', '.rm', '.mpg', '.mpe', '.mpeg', '.m4v', '.3gp', '.mts']
     extra_formats = [
         '-edited', '-effects', '-smile', '-mix',  # EN/US
         '-edytowane',  # PL
@@ -268,9 +273,17 @@ def main():
             if len(files) < 2:
                 continue # this file size is unique, no need to spend cpu cycles on it
             original = None
+            # Prefer the one from folders like 'Photos from 20xx' which more likely you find a json file with it
             for file in files:
-                if not _re.search(r'\(\d+\).', file.name):
+                if _re.search(r'^Photos from \d{4}$', file.parent.stem):
                     original = file
+                    break
+            # If not found then we exclude those files with filenames have '(1)' or '(2)' or something like that in them
+            if original is None:
+                for file in files:
+                    if not _re.search(r'\(\d+\).', file.stem):
+                        original = file
+            # If still no original found, then we pick the arbitrary one
             if original is None:
                 original = files[0]
 
@@ -318,22 +331,62 @@ def main():
             try:
                 with open(potential_json, 'r') as f:
                     dict = _json.load(f)
-                return dict
+                return dict, potential_json
             except:
                 raise FileNotFoundError(f"Couldn't open json file: {potential_json}")
         else:
-            # Try find json file under the 51-character-limit from Google
-            # Truncate file.name by (51-5) characters and find it again
-            filename_wo_suffix = file.with_suffix('').name
-            filename_truncated51 = filename_wo_suffix[:51-5] + ".json"
-            potential_json = file.parent.joinpath(filename_truncated51)
-            if potential_json.is_file():
-                try:
-                    with open(potential_json, 'r') as f:
-                        dict = _json.load(f)
-                    return dict
-                except:
-                    raise FileNotFoundError(f"Couldn't open json file: {potential_json}")
+            print("Cannot find regular accompanying json file. Try searching in case insensitive way...")
+            # Try finding json in a case insensitive but inefficient way
+            directory = file.parent
+            potential_json_filename = str(file.with_name(file.name + '.json').resolve())
+
+            potential_json_filenames = [filename for filename in directory.iterdir() if _re.search(rf'{potential_json_filename}$', str(filename), _re.IGNORECASE)]
+            if len(potential_json_filenames) > 0:
+                potential_json = file.with_name(potential_json_filenames[0].name)
+                if potential_json.is_file():
+                    try:
+                        with open(potential_json, 'r') as f:
+                            dict = _json.load(f)
+                        return dict, potential_json
+                    except:
+                        raise FileNotFoundError(f"Couldn't open json file: {potential_json}")
+
+            else:
+                print('Cannot find the json even case insensitive way. Try ignoring the suffix of the file and search again...')
+                # Remove _all_ the suffixes
+                suffixes = file.suffixes
+                file_stem = file
+                for i in range(len(suffixes)):
+                    file_stem = file_stem.with_suffix('')
+               
+                # Search while excluding trailing ({d+})
+                file_stem = file_stem.stem
+                file_stem = _re.sub(r'\(\d+\)', r'', file_stem)
+                potential_json_filenames = [filename for filename in directory.iterdir() if _re.search(rf'{file_stem}.*\.json$', str(filename), _re.IGNORECASE)]
+
+                if len(potential_json_filenames) > 0:
+                    potential_json = file.with_name(potential_json_filenames[0].name)
+                    if potential_json.is_file():
+                        try:
+                            with open(potential_json, 'r') as f:
+                                dict = _json.load(f)
+                            return dict, potential_json
+                        except:
+                            raise FileNotFoundError(f"Couldn't open json file: {potential_json}")
+                else:
+                    print("Try searching json file harder by applying 51-character-truncation rule.")
+                    # Try find json file under the 51-character-limit from Google
+                    # Truncate file.name by (51-5) characters and find it again
+                    filename_wo_suffix = file.with_suffix('').name
+                    filename_truncated51 = filename_wo_suffix[:51-5] + ".json"
+                    potential_json = file.parent.joinpath(filename_truncated51)
+                    if potential_json.is_file():
+                        try:
+                            with open(potential_json, 'r') as f:
+                                dict = _json.load(f)
+                            return dict, potential_json
+                        except:
+                            raise FileNotFoundError(f"Couldn't open json file: {potential_json}")
 
         raise FileNotFoundError(f"Couldn't find json for file: {file}")
 
@@ -552,7 +605,7 @@ def main():
             print('No creation date found in exif!')
 
         try:
-            google_json = find_json_for_file(file)
+            google_json, json_file = find_json_for_file(file)
             date = get_date_str_from_json(google_json)
             set_file_geo_data(file, google_json)
             set_file_exif_date(file, date)
@@ -615,14 +668,29 @@ def main():
                 return False
         return True
 
-    def copy_to_target(file: Path):
-        if is_photo(file) or is_video(file):
-            new_file = new_name_if_exists(FIXED_DIR / file.name)
+    def copy_from_to(file: Path, new_file: Path):
+        if copyfile(file, new_file):
             nonlocal s_copied_files
-            if copyfile(file, new_file):
-                s_copied_files.append(str(file))
-                return True
+            s_copied_files.append(str(file.resolve()))
+
+            # copy json file if needed
+            if args.copy_json:
+                try:
+                    json, jsonfile = find_json_for_file(file)
+                    new_path = new_file.parent
+                    new_jsonfile = new_name_if_exists(new_path / jsonfile.name)
+
+                    if copyfile(jsonfile, new_jsonfile):
+                        s_copied_files.append(str(jsonfile.resolve()))
+                except FileNotFoundError:
+                    print(f'JSON_file for {file} cannot be found. Skipping.')
+
+            return True
         return False
+
+    def copy_to_target(file: Path):
+        new_file = new_name_if_exists(FIXED_DIR / file.name)
+        return copy_from_to(file, new_file)
 
     def copy_to_target_and_divide_YYYY_MM(file: Path):
         creation_date = file.stat().st_mtime
@@ -633,12 +701,7 @@ def main():
         new_path.mkdir(parents=True, exist_ok=True)
 
         new_file = new_name_if_exists(new_path / file.name)
-
-        nonlocal s_copied_files
-        if copyfile(file, new_file):
-            s_copied_files.append(str(file))
-            return True
-        return False
+        return copy_from_to(file, new_file)
 
     def copy_to_target_and_divide_YYYYMMDD(file: Path):
         creation_date = file.stat().st_mtime
@@ -649,12 +712,7 @@ def main():
         new_path.mkdir(parents=True, exist_ok=True)
 
         new_file = new_name_if_exists(new_path / file.name)
-
-        nonlocal s_copied_files
-        if copyfile(file, new_file):
-            s_copied_files.append(str(file))
-            return True
-        return False
+        return copy_from_to(file, new_file)
 
     def report_progress(progress):
         symbols = ('-', '/', '|', '\\')
